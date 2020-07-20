@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  This cloudformation template creates ECR Repository, EventBridge, Lambda function and S3 bucket to save ECR image scan
+  results to S3 Bucket.
+  - ECR repository that on-push scan is enabled, you can name your repository using the RepositoryName parameter.
+  - EventBridge will connect your repository and lambda function to trigger lambda function when image scanning
+    is completed.
+  - Lambda function will retrieve the latest scan result and store that on a private S3 bucket that you will name using
+    BucketName parameter.
+  For more information regarding ECR container image scanning and this setup, you can check
+  https://www.sufle.io/blog/xxxxxx
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuration"
+        Parameters:
+          - RepositoryName
+          - BucketName
+
+Parameters:
+  RepositoryName:
+    Description: Name of the ECR repository
+    Type: String
+    AllowedPattern: ^[a-z1-9]*$
+
+  BucketName:
+    Description: Name of the S3 bucket that scan results will stored in.
+    Type: String
+    AllowedPattern: ^[a-z1-9]*$
+
+Resources:
+
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+
+  RoleForEnableScanLambda:
+    Type: AWS::IAM::Role
+    DependsOn: Repository
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowPutImageScanningConfiguration
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ecr:PutImageScanningConfiguration
+                Resource: !GetAtt Repository.Arn
+
+  EnableScanLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - RoleForEnableScanLambda
+      - Repository
+    Properties:
+      FunctionName: EnableScanLambdaFunction
+      Description: Backup ECR Scan Results to S3 Bucket
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt RoleForEnableScanLambda.Arn
+      Runtime: python3.7
+      Timeout: 10
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+
+          ECR_REPO = '${RepositoryName}'
+
+          def lambda_handler(event, context):
+
+              client = boto3.client('ecr')
+
+              response = client.put_image_scanning_configuration(
+                  repositoryName=ECR_REPO,
+                  imageScanningConfiguration={
+                      'scanOnPush': True
+                  }
+              )
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "")
+
+  EnableScanResource:
+    Type: "Custom::EnableScanResource"
+    DependsOn: EnableScanLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt EnableScanLambdaFunction.Arn
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+
+  RoleForScanSaverLambda:
+    Type: AWS::IAM::Role
+    DependsOn: S3Bucket
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowPutObject
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${S3Bucket.Arn}/*"
+        - PolicyName: AllowDescribeImageScanFindings
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ecr:DescribeImageScanFindings
+                Resource: !GetAtt Repository.Arn
+
+  ScanSaverLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RoleForScanSaverLambda
+    Properties:
+      FunctionName: ScanSaverLambdaFunction
+      Description: Backup ECR Scan Results to S3 Bucket
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt RoleForScanSaverLambda.Arn
+      Runtime: python3.7
+      Timeout: 10
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import datetime
+
+          S3_BUCKET = '${BucketName}'
+          ECR_REPO = '${RepositoryName}'
+
+          def lambda_handler(event, context):
+
+              client = boto3.client('ecr')
+
+              response = client.describe_image_scan_findings(
+                  repositoryName=ECR_REPO,
+                  imageId={
+                      'imageDigest': event['detail']['image-digest']
+                  }
+              )
+
+              encoded_string = response.encode("utf-8")
+
+              s3 = boto3.resource("s3")
+              file_name = f"{datetime.timestamp(datetime.datetime.now)}.json"
+              s3.Bucket(S3_BUCKET).put_object(Key=file_name, Body=encoded_string)
+
+  EventRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - Repository
+      - ScanSaverLambdaFunction
+    Properties:
+      Description: "EventRule"
+      EventPattern:
+        source:
+          - "aws.ecr"
+        detail-type:
+          - "ECR Image Scan"
+        detail:
+          scan-status:
+            - "COMPLETE"
+          repository-name:
+            - !Ref Repository
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt ScanSaverLambdaFunction.Arn
+          Id: "TargetFunction"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    DependsOn: EventRule
+    Properties:
+      FunctionName: !Ref ScanSaverLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventRule.Arn
