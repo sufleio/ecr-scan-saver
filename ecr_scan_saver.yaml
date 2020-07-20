@@ -150,6 +150,7 @@ Resources:
         ZipFile: !Sub |
           import boto3
           import datetime
+          import json
 
           S3_BUCKET = '${BucketName}'
           ECR_REPO = '${RepositoryName}'
@@ -165,11 +166,17 @@ Resources:
                   }
               )
 
-              encoded_string = response.encode("utf-8")
+              response["imageScanFindings"]["imageScanCompletedAt"] = \
+                  response["imageScanFindings"]["imageScanCompletedAt"].strftime("%Y-%m-%d %H:%M:%S")
+              response["imageScanFindings"]["vulnerabilitySourceUpdatedAt"] = \
+                  response["imageScanFindings"]["vulnerabilitySourceUpdatedAt"].strftime("%Y-%m-%d %H:%M:%S")
+              result = json.dumps(response).encode('utf8')
 
               s3 = boto3.resource("s3")
-              file_name = f"{datetime.timestamp(datetime.datetime.now)}.json"
-              s3.Bucket(S3_BUCKET).put_object(Key=file_name, Body=encoded_string)
+              now = datetime.datetime.now()
+              timestamp = now.strftime("%m%d%Y-%H%M%S")
+              file_name = f"scan-result-{timestamp}.json"
+              s3.Bucket(S3_BUCKET).put_object(Key=file_name, Body=result)
 
   EventRule:
     Type: AWS::Events::Rule
