@@ -5,4 +5,4 @@ This cloudformation template creates ECR Repository, EventBridge, Lambda functio
 - EventBridge will connect your repository and lambda function to trigger lambda function when image scanning is completed.
 - Lambda function will retrieve the latest scan result and store that on a private S3 bucket that you will name using **BucketName** parameter.
 
-For more information regarding ECR container image scanning and this setup, you can check https://www.sufle.io/blog/xxxxxxa
+For more information regarding ECR container image scanning and this setup, you can check https://www.sufle.io/blog/container-image-scanning
